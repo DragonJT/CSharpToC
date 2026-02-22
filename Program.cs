@@ -4,11 +4,97 @@ using Microsoft.CodeAnalysis;
 using System.Text;
 using System.Diagnostics;
 
+
+class TypeData(string name, bool isPrimitive, bool hasCAttribute)
+{
+    public string name = name;
+    public bool isPrimitive = isPrimitive;
+    public bool hasCAttribute = hasCAttribute;
+}
+
 static class Program
 {
     static SemanticModel model;
     static StringBuilder builder;
-    readonly static Dictionary<string, string> ctypes = new(){{"Single", "float"}, {"Int32", "int"}};
+    readonly static Dictionary<string, string> primitives = new(){{"Single", "float"}, {"Int32", "int"}};
+    static readonly Dictionary<SyntaxNode, string> nodeNames = [];
+    static readonly Dictionary<MemberDeclarationSyntax, string> defaultConstructors = [];
+    static ClassDeclarationSyntax currentClass;
+    static int id = 0;
+
+    static int GetUniqueID()
+    {
+        var result = id;
+        id++;
+        return result;
+    }
+
+    static string InternalGetName(SyntaxNode node)
+    {
+        if(node is MethodDeclarationSyntax method)
+        {
+            var classDecl = method.Parent as ClassDeclarationSyntax;
+            return classDecl.Identifier.ValueText + "_" + method.Identifier.ValueText+"_"+GetUniqueID();
+        }
+        else if(node is ConstructorDeclarationSyntax constructor)
+        {
+            var classDecl = constructor.Parent as ClassDeclarationSyntax;
+            return classDecl.Identifier.ValueText+"_constructor_"+GetUniqueID();
+        }
+        else if(node is ClassDeclarationSyntax classDeclarationSyntax)
+        {
+            return classDeclarationSyntax.Identifier.ValueText;
+        }
+        else if(node is StructDeclarationSyntax structDeclarationSyntax)
+        {
+            return structDeclarationSyntax.Identifier.ValueText;
+        }
+        else
+        {
+            throw new NotImplementedException(node.GetType().Name);
+        }
+    }
+
+    static string GetName(SyntaxNode node)
+    {
+        if(nodeNames.TryGetValue(node, out string name))
+        {
+            return name;
+        }
+        else
+        {
+            var newName = InternalGetName(node);
+            nodeNames.Add(node, newName);
+            return newName;
+        }
+    }
+
+    static string GetDefaultConstructorName(ClassDeclarationSyntax classDeclarationSyntax)
+    {
+        if(defaultConstructors.TryGetValue(classDeclarationSyntax, out string name))
+        {
+            return name;
+        }
+        var newName = GetName(classDeclarationSyntax) + "_defaultConstructor_"+GetUniqueID();
+        defaultConstructors.Add(classDeclarationSyntax, newName);
+        return newName;
+    }
+
+    static TypeData GetTypeData(ITypeSymbol typeSymbol)
+    {
+        var refs = typeSymbol.DeclaringSyntaxReferences;
+        if(refs.Length > 0)
+        {
+            var syntax = refs[0].GetSyntax();
+            bool hasCAttribute = HasCAttribute((MemberDeclarationSyntax)syntax);
+            var name = GetName(syntax);
+            return new TypeData(name, false, hasCAttribute);
+        }
+        else
+        {
+            return new TypeData(primitives[typeSymbol.Name], true, false);
+        }
+    }
 
     static void EmitObjectCreation(ExpressionSyntax expressionSyntax, string varname)
     {
@@ -40,7 +126,6 @@ static class Program
         }
     }
 
-/*
     static bool HasCAttribute(MemberDeclarationSyntax memberDeclarationSyntax)
     {
         foreach(var al in memberDeclarationSyntax.AttributeLists)
@@ -54,7 +139,12 @@ static class Program
             }
         }
         return false;
-    }*/
+    }
+
+    static string[] EmitArgs(ArgumentListSyntax args)
+    {
+        return args.Arguments.Select(a=>Emit(a.Expression)).ToArray();
+    }
 
     static string Emit(ExpressionSyntax expressionSyntax)
     {
@@ -73,15 +163,16 @@ static class Program
                 }
                 else
                 {
-                    var args = invocationExpressionSyntax
-                        .ArgumentList.Arguments.Select(a=>Emit(a.Expression))
-                        .ToArray();
+                    var args = EmitArgs(invocationExpressionSyntax.ArgumentList);
                     return declaration.Identifier.ValueText+"("+string.Join(", ", args)+")";
                 } 
             }
             else
             {
-                throw new NotImplementedException();
+                var arg1 = Emit(invocationExpressionSyntax.Expression);
+                var name = GetName(declaration); 
+                string[] args = [arg1, ..EmitArgs(invocationExpressionSyntax.ArgumentList)];
+                return name+"("+string.Join(", ", args)+")";
             }
         }
         else if(expressionSyntax is ElementAccessExpressionSyntax elementAccessExpressionSyntax)
@@ -95,11 +186,7 @@ static class Program
             var typeInfo = model.GetTypeInfo(collectionExpressionSyntax);
             if (typeInfo.ConvertedType is IArrayTypeSymbol arrayType)
             {
-                var typename = arrayType.ElementType.Name;
-                if(ctypes.TryGetValue(typename, out var ctypename))
-                {
-                    typename = ctypename;
-                }
+                var typename = GetTypeData(arrayType.ElementType).name;
                 List<string> elements = [];
                 foreach(var e in collectionExpressionSyntax.Elements)
                 {
@@ -134,7 +221,24 @@ static class Program
         }
         else if(expressionSyntax is IdentifierNameSyntax identifierNameSyntax)
         {
-            return identifierNameSyntax.Identifier.ValueText;
+            var identifierSymbol = model.GetSymbolInfo(identifierNameSyntax).Symbol;
+            if(identifierSymbol is IFieldSymbol fieldSymbol)
+            {
+                var classDecl = (ClassDeclarationSyntax)fieldSymbol.ContainingType.DeclaringSyntaxReferences
+                    .FirstOrDefault().GetSyntax();
+                if(currentClass == classDecl)
+                {
+                    return "this->"+identifierNameSyntax.Identifier.ValueText;
+                }
+                else
+                {
+                    throw new Exception();
+                }
+            }
+            else
+            {
+                return identifierNameSyntax.Identifier.ValueText;
+            }
         }
         else if(expressionSyntax is ImplicitObjectCreationExpressionSyntax implicitObjectCreationExpressionSyntax)
         {
@@ -142,12 +246,42 @@ static class Program
         }
         else if(expressionSyntax is ObjectCreationExpressionSyntax objectCreationExpressionSyntax)
         {
-            var typename = objectCreationExpressionSyntax.Type.ToString();
-            var args = objectCreationExpressionSyntax
-                .ArgumentList
-                .Arguments
-                .Select(a=>Emit(a.Expression));
-            return $"({typename}){{{string.Join(", ", args)}}}";
+            var ctorSymbol = (IMethodSymbol)model.GetSymbolInfo(objectCreationExpressionSyntax).Symbol;
+            var ctor = ctorSymbol.DeclaringSyntaxReferences.FirstOrDefault();
+
+            if(ctor == null)
+            {
+                var typeDecl = (ClassDeclarationSyntax)ctorSymbol
+                    .ContainingType.DeclaringSyntaxReferences
+                    .First()
+                    .GetSyntax();
+                var name = GetDefaultConstructorName(typeDecl);
+                var args = EmitArgs(objectCreationExpressionSyntax.ArgumentList);
+                return $"{name}({string.Join(", ", args)})";
+            }
+            else
+            {
+                var syntax = ctor.GetSyntax() as MemberDeclarationSyntax;
+                if (!HasCAttribute(syntax))
+                {
+                    var name = GetName(syntax);
+                    var args = EmitArgs(objectCreationExpressionSyntax.ArgumentList);
+                    return $"{name}({string.Join(", ", args)})";
+                }
+                else
+                {
+                    if(syntax is MemberDeclarationSyntax memberDeclarationSyntax)
+                    {
+                        var name = GetName(memberDeclarationSyntax);
+                        var args = EmitArgs(objectCreationExpressionSyntax.ArgumentList);
+                        return $"({name}){{{string.Join(", ", args)}}}";
+                    }
+                    else
+                    {
+                        throw new NotImplementedException(syntax.GetType().Name);
+                    }
+                }
+            }
         }
         else if(expressionSyntax is MemberAccessExpressionSyntax memberAccessExpressionSyntax)
         {
@@ -181,7 +315,7 @@ static class Program
             }
             else
             {
-                throw new NotImplementedException(symbol.GetType().Name);
+                return Emit(memberAccessExpressionSyntax.Expression);
             }
         }
         else if(expressionSyntax is LiteralExpressionSyntax literalExpressionSyntax)
@@ -260,37 +394,28 @@ static class Program
         {
             var decl = localDeclarationStatementSyntax.Declaration;
             string typename;
-            bool isArray = false;
-            if (decl.Type.IsVar)
+            bool isPtr = false;
+
+            var symbolInfo = model.GetSymbolInfo(localDeclarationStatementSyntax.Declaration.Type);
+            if(symbolInfo.Symbol is IArrayTypeSymbol arrayTypeSymbol)
             {
-                var symbolInfo = model.GetSymbolInfo(localDeclarationStatementSyntax.Declaration.Type);
-                if(symbolInfo.Symbol is IArrayTypeSymbol arrayTypeSymbol)
+                typename = GetTypeData(arrayTypeSymbol.ElementType).name;
+                isPtr = true;
+            }
+            else if(symbolInfo.Symbol is ITypeSymbol typeSymbol)
+            {
+                var typedata = GetTypeData(typeSymbol);
+                if (!typedata.hasCAttribute)
                 {
-                    typename = arrayTypeSymbol.ElementType.Name;
-                    isArray = true;
+                    isPtr = true;
                 }
-                else
-                {
-                    typename = symbolInfo.Symbol.Name.ToString();
-                }
+                typename = typedata.name;
             }
             else
             {
-                if(decl.Type is ArrayTypeSyntax arrayTypeSyntax)
-                {
-                    typename = arrayTypeSyntax.ElementType.ToString();
-                    isArray = true;
-                }
-                else
-                {
-                    typename = decl.Type.ToString();
-                }
+                throw new NotImplementedException();
             }
-            if(ctypes.TryGetValue(typename, out var ctypename))
-            {
-                typename = ctypename;
-            }
-            var fullCTypeName = isArray?typename+"*":typename;
+            var fullCTypeName = isPtr?typename+"*":typename;
 
             var variable = decl.Variables[0];
             var varname = variable.Identifier.ValueText;
@@ -322,6 +447,90 @@ static class Program
         builder.AppendLine("}");
     }
 
+    static void EmitConstructors(ClassDeclarationSyntax[] classDeclarationSyntaxes)
+    {
+        foreach(var c in classDeclarationSyntaxes)
+        {
+            var name = GetName(c);
+            if (!HasCAttribute(c) && name!="CAttribute")
+            {
+                if (c.Modifiers.Any(SyntaxKind.StaticKeyword))
+                {
+                    
+                }
+                else
+                {
+                    var constructors = c.DescendantNodes().OfType<ConstructorDeclarationSyntax>().ToArray();
+                    if(constructors.Length == 0)
+                    {
+                        var constructorName = GetDefaultConstructorName(c);
+                        var funcString = $@"{name}* {constructorName}()
+{{
+    return ({name}*)malloc(sizeof({name}));
+}}
+                        ";
+                        builder.AppendLine(funcString);
+                    }
+                    else
+                    {
+                        throw new NotImplementedException(c.ToString());
+                    }
+                }
+                
+            }
+            
+        }
+    }
+
+    static void EmitMethods(MethodDeclarationSyntax[] methodDeclarationSyntaxes)
+    {
+        foreach(var m in methodDeclarationSyntaxes)
+        {
+            if(m.Identifier.ValueText == "Main")
+            {
+                currentClass = null;
+                builder.AppendLine("int main()");
+                Emit(m.Body);
+                builder.AppendLine();
+            }
+            else if (m.Modifiers.Any(SyntaxKind.ExternKeyword) || m.Modifiers.Any(SyntaxKind.StaticKeyword))
+            {
+            }
+            else{
+                currentClass = (ClassDeclarationSyntax)m.Parent;
+                var name = GetName(m);
+                var parameters = m.ParameterList.Parameters
+                    .Select(p=>p.Type.ToString()+" "+p.Identifier.ValueText)
+                    .ToArray();
+                string[] finalParameters = [currentClass.Identifier.ValueText+" *this", ..parameters];
+                var returnType = m.ReturnType.ToString();
+                builder.AppendLine($"{returnType} {name}({string.Join(", ", finalParameters)})");
+                Emit(m.Body);
+                builder.AppendLine();
+            }
+        }
+    }
+
+    static void EmitClasses(ClassDeclarationSyntax[] classDeclarationSyntaxes)
+    {
+        foreach(var c in classDeclarationSyntaxes)
+        {
+            var name = GetName(c);
+            if (!HasCAttribute(c) && name!="CAttribute")
+            {
+                builder.AppendLine($"typedef struct {name} {{");
+                foreach(var f in c.Members.OfType<FieldDeclarationSyntax>())
+                {
+                    builder.AppendLine(
+                        f.Declaration.Type.ToString()+" "
+                        +f.Declaration.Variables[0].Identifier.ValueText+";");
+                }
+                builder.AppendLine($"}}{name};");
+                builder.AppendLine();
+            }
+        }   
+    }
+
     static void Main()
     {
         var source = File.ReadAllText("../FPS/Program.cs");
@@ -332,19 +541,18 @@ static class Program
                    new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
 
         model = compilation.GetSemanticModel(tree);
-        var main = tree.GetRoot().DescendantNodes()
-            .OfType<MethodDeclarationSyntax>()
-            .First(m => m.Identifier.ValueText == "Main");
-        
         builder = new();
         builder.AppendLine("#include <stdio.h>");
         builder.AppendLine("#include \"raylib.h\"");
         builder.AppendLine("#include \"raymath.h\"");
         builder.AppendLine("#define RLIGHTS_IMPLEMENTATION");
         builder.AppendLine("#include \"rlights.h\"");
+        builder.AppendLine("#include <stdlib.h>");
 
-        builder.AppendLine("int main()");
-        Emit(main.Body);
+        EmitClasses([.. tree.GetRoot().DescendantNodes().OfType<ClassDeclarationSyntax>()]);
+        EmitConstructors([.. tree.GetRoot().DescendantNodes().OfType<ClassDeclarationSyntax>()]);
+        EmitMethods([.. tree.GetRoot().DescendantNodes().OfType<MethodDeclarationSyntax>()]);
+
         File.WriteAllText("c/main.c", builder.ToString());
         var process = Process.Start("gcc", "c/main.c -o c/main.out -l raylib -lm");
         process.WaitForExit();
